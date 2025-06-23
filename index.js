@@ -137,3 +137,12 @@ app.post('/api/checkWithdrawPwd', async (req, res) => {
   }
 });
 
+// 新增：获取用户信息（会员姓名等）
+app.get('/api/userinfo', async (req, res) => {
+  const { username } = req.query;
+  if (!username) return res.status(400).json({ error: '缺少用户名' });
+  const user = await prisma.user.findUnique({ where: { username: String(username) } });
+  if (!user) return res.status(404).json({ error: '用户不存在' });
+  res.json({ fullName: user.fullName, username: user.username });
+});
+
