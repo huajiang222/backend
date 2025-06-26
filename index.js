@@ -1,13 +1,14 @@
 import express from 'express';
 import cors from 'cors';
 import { PrismaClient } from '@prisma/client';
-const prisma = new PrismaClient();
 
+const prisma = new PrismaClient();
 const app = express();
+
 app.use(cors());
 app.use(express.json());
 
-// 简易注册
+// 用户注册
 app.post('/api/register', async (req, res) => {
   try {
     const user = await prisma.user.create({ data: req.body });
@@ -17,70 +18,147 @@ app.post('/api/register', async (req, res) => {
   }
 });
 
-// 登录接口
+// 用户登录
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
   const user = await prisma.user.findUnique({ where: { username } });
-  if (!user) {
-    return res.status(400).json({ error: '用户不存在' });
-  }
-  if (user.password !== password) {
-    return res.status(400).json({ error: '密码错误' });
+  if (!user || user.password !== password) {
+    return res.status(400).json({ error: '用户名或密码错误' });
   }
   res.json({ username: user.username, fullName: user.fullName });
 });
 
-// 测试用 GET
-app.get('/api/hello', (_, res) => res.json({ msg: 'world' }));
-
-app.listen(4000, () => console.log('Backend running → http://localhost:4000'));
-
-app.get('/', (_, res) => {
-  res.send('Backend is up and running 👍');
+// 创建充值或提现记录
+app.post('/api/transactions', async (req, res) => {
+  let { userId, type, amount, orderNo, bankName, bankAccount, bankAccountName, proofUrl, remark } = req.body;
+  try {
+    // 强制转换 amount 为字符串数字
+    amount = amount ? amount.toString() : "0";
+    const transaction = await prisma.transaction.create({
+      data: {
+        userId,
+        type,
+        amount,
+        orderNo,
+        bankName,
+        bankAccount,
+        bankAccountName,
+        proofUrl,
+        remark,
+        status: 'pending'
+      }
+    });
+    res.json(transaction);
+  } catch (e) {
+    res.status(400).json({ error: '创建记录失败', detail: e.message });
+  }
 });
 
-// /api/users?username=xxx 查询用户名是否存在
-app.get('/api/users', async (req, res) => {
-  const { username } = req.query;
-  if (!username) return res.json([]);
-  const user = await prisma.user.findMany({ where: { username: String(username) } });
-  res.json(user);
+// 获取充值提现记录列表
+app.get('/api/transactions', async (req, res) => {
+  const { type, status, userId, page = 1, pageSize = 20 } = req.query;
+  const conditions = {};
+  if (type) conditions.type = type;
+  if (status) conditions.status = status;
+  if (userId) conditions.userId = parseInt(userId);
+
+  const transactions = await prisma.transaction.findMany({
+    where: conditions,
+    skip: (page - 1) * pageSize,
+    take: parseInt(pageSize),
+    orderBy: { createdAt: 'desc' },
+    include: { user: true }
+  });
+
+  res.json(transactions);
 });
 
-// /api/setWithdrawPwd 设置提现密码
+// 审核充值提现记录
+app.patch('/api/transactions/:id', async (req, res) => {
+  const { status, reviewBy, remark } = req.body;
+  const id = parseInt(req.params.id);
+
+  try {
+    const transaction = await prisma.transaction.findUnique({ where: { id } });
+    if (!transaction || transaction.status !== 'pending') {
+      return res.status(400).json({ error: '记录不存在或已审核' });
+    }
+
+    await prisma.$transaction(async (tx) => {
+      await tx.transaction.update({
+        where: { id },
+        data: {
+          status,
+          reviewBy,
+          reviewTime: new Date(),
+          remark
+        }
+      });
+
+      if (status === 'approved') {
+        const user = await tx.user.findUnique({ where: { id: transaction.userId } });
+
+        if (transaction.type === 'deposit') {
+          await tx.user.update({
+            where: { id: user.id },
+            data: { points: user.points + Number(transaction.amount) }
+          });
+        } else if (transaction.type === 'withdraw') {
+          await tx.user.update({
+            where: { id: user.id },
+            data: { points: user.points - Number(transaction.amount) }
+          });
+        }
+      }
+    });
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: '审核失败', detail: e.message });
+  }
+});
+
+// 获取单个用户所有交易记录
+app.get('/api/users/:userId/transactions', async (req, res) => {
+  const { userId } = req.params;
+  const { page = 1, pageSize = 10 } = req.query;
+
+  const transactions = await prisma.transaction.findMany({
+    where: { userId: parseInt(userId) },
+    skip: (page - 1) * pageSize,
+    take: parseInt(pageSize),
+    orderBy: { createdAt: 'desc' }
+  });
+
+  res.json(transactions);
+});
+
+// 设置提现密码
 app.post('/api/setWithdrawPwd', async (req, res) => {
   const { username, withdrawPwd } = req.body;
-  if (!username || !withdrawPwd) return res.status(400).json({ error: '参数缺失' });
-  console.log('setWithdrawPwd:', req.body);
   try {
-    const user = await prisma.user.update({
+    await prisma.user.update({
       where: { username },
       data: { withdrawPwd }
     });
     res.json({ success: true });
   } catch (e) {
-    if (e.code === 'P2025') {
-      // Prisma: Record not found
-      res.status(404).json({ error: '用户不存在' });
-    } else {
-      res.status(500).json({ error: '保存失败', detail: e.message });
-    }
+    res.status(500).json({ error: '保存失败', detail: e.message });
   }
 });
 
+// 添加提现银行账户信息
 app.post('/api/addWithdrawMethod', async (req, res) => {
   const { username, bankName, accountName, accountNumber } = req.body;
-  if (!username || !bankName || !accountName || !accountNumber) {
-    return res.status(400).json({ error: '参数缺失' });
-  }
+  const user = await prisma.user.findUnique({ where: { username } });
+  if (!user) return res.status(404).json({ error: '用户不存在' });
   try {
-    // 直接更新 User 表
-    const user = await prisma.user.update({
-      where: { username },
+    await prisma.withdrawMethod.create({
       data: {
+        userId: user.id,
         bankName,
-        bankAccountName: accountName,
-        bankAccount: accountNumber,
+        accountName,
+        accountNumber
       }
     });
     res.json({ success: true });
@@ -89,60 +167,46 @@ app.post('/api/addWithdrawMethod', async (req, res) => {
   }
 });
 
-// 查询用户收款账号信息
-app.get('/api/getWithdrawAccounts', async (req, res) => {
+// 获取用户信息（支持通过用户名查询）
+app.get('/api/users', async (req, res) => {
   const { username } = req.query;
   if (!username) return res.json([]);
-  // 假设你的 user 表有 bankName、bankAccountName、bankAccount 字段
-  const user = await prisma.user.findUnique({ where: { username } });
-  if (!user || !user.bankName || !user.bankAccountName || !user.bankAccount) {
-    return res.json([]);
-  }
-  res.json([
-    {
-      bankName: user.bankName,
-      accountName: user.bankAccountName,
-      accountNumber: user.bankAccount,
-    }
-  ]);
+  const users = await prisma.user.findMany({ where: { username } });
+  res.json(users);
 });
 
-// 检查用户是否已设置提现密码和完整银行信息
+// 检查用户是否已设置提现密码和至少一个提现银行卡
 app.get('/api/checkWithdrawReady', async (req, res) => {
   const { username } = req.query;
   if (!username) return res.json({ ready: false });
-  const user = await prisma.user.findUnique({ where: { username } });
-  if (
-    user &&
-    user.withdrawPwd &&
-    user.bankName &&
-    user.bankAccountName &&
-    user.bankAccount
-  ) {
-    res.json({ ready: true });
-  } else {
-    res.json({ ready: false });
-  }
+  const user = await prisma.user.findUnique({
+    where: { username },
+    include: { withdrawMethods: true }
+  });
+  if (!user) return res.json({ ready: false });
+  // 判断条件：有提现密码且有至少一个银行卡
+  const ready = !!user.withdrawPwd && user.withdrawMethods.length > 0;
+  res.json({ ready });
 });
 
-// /api/checkWithdrawPwd
 app.post('/api/checkWithdrawPwd', async (req, res) => {
   const { username, withdrawPwd } = req.body;
-  if (!username || !withdrawPwd) return res.json({ ok: false });
   const user = await prisma.user.findUnique({ where: { username } });
-  if (user && user.withdrawPwd === withdrawPwd) {
-    res.json({ ok: true });
-  } else {
-    res.json({ ok: false });
+  if (!user || user.withdrawPwd !== withdrawPwd) {
+    return res.json({ ok: false });
   }
+  res.json({ ok: true });
 });
 
-// 新增：获取用户信息（会员姓名等）
-app.get('/api/userinfo', async (req, res) => {
+app.get('/api/getWithdrawAccounts', async (req, res) => {
   const { username } = req.query;
-  if (!username) return res.status(400).json({ error: '缺少用户名' });
-  const user = await prisma.user.findUnique({ where: { username: String(username) } });
-  if (!user) return res.status(404).json({ error: '用户不存在' });
-  res.json({ fullName: user.fullName, username: user.username });
+  const user = await prisma.user.findUnique({
+    where: { username },
+    include: { withdrawMethods: true }
+  });
+  if (!user) return res.json([]);
+  res.json(user.withdrawMethods);
 });
 
+app.get('/', (_, res) => res.send('Backend is up and running 👍'));
+app.listen(4000, () => console.log('Backend running → http://localhost:4000'));
