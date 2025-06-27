@@ -1,9 +1,24 @@
 import express from 'express';
 import cors from 'cors';
 import { PrismaClient } from '@prisma/client';
+import multer from "multer";
+import path from "path";
 
 const prisma = new PrismaClient();
 const app = express();
+
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, "uploads/");
+  },
+  filename: function (req, file, cb) {
+    // 保留原始扩展名
+    const ext = path.extname(file.originalname);
+    const basename = Date.now() + "-" + Math.round(Math.random() * 1e9);
+    cb(null, basename + ext);
+  }
+});
+const upload = multer({ storage });
 
 app.use(cors());
 app.use(express.json());
@@ -25,6 +40,8 @@ app.post('/api/login', async (req, res) => {
   if (!user || user.password !== password) {
     return res.status(400).json({ error: '用户名或密码错误' });
   }
+  // 新增：记录用户活跃
+  updateUserActive(user.id, user.username);
   res.json({ username: user.username, fullName: user.fullName });
 });
 
@@ -62,24 +79,27 @@ app.get('/api/transactions', async (req, res) => {
   if (status) conditions.status = status;
   if (userId) conditions.userId = parseInt(userId);
 
-  const transactions = await prisma.transaction.findMany({
-    where: conditions,
-    skip: (page - 1) * pageSize,
-    take: parseInt(pageSize),
-    orderBy: { createdAt: 'desc' },
-    include: { user: true }
-  });
-
-  res.json(transactions);
+  try {
+    const transactions = await prisma.transaction.findMany({
+      where: conditions,
+      skip: (page - 1) * pageSize,
+      take: parseInt(pageSize),
+      orderBy: { createdAt: 'desc' },
+      include: { user: true }
+    });
+    res.json(transactions);
+  } catch (e) {
+    res.status(500).json({ error: '查询失败', detail: e.message });
+  }
 });
 
 // 审核充值提现记录
 app.patch('/api/transactions/:id', async (req, res) => {
-  const { status, reviewBy, remark } = req.body;
+  const { status, reviewBy, remark, points } = req.body;
   const id = parseInt(req.params.id);
 
   try {
-    const transaction = await prisma.transaction.findUnique({ where: { id } });
+    const transaction = await prisma.transaction.findUnique({ where: { id }, include: { user: true } });
     if (!transaction || transaction.status !== 'pending') {
       return res.status(400).json({ error: '记录不存在或已审核' });
     }
@@ -95,20 +115,24 @@ app.patch('/api/transactions/:id', async (req, res) => {
         }
       });
 
+      // 审核通过时同步点数
       if (status === 'approved') {
-        const user = await tx.user.findUnique({ where: { id: transaction.userId } });
-
+        let newPoints = transaction.user.points;
+        const syncValue = points !== undefined ? Number(points) : Number(transaction.amount);
         if (transaction.type === 'deposit') {
-          await tx.user.update({
-            where: { id: user.id },
-            data: { points: user.points + Number(transaction.amount) }
-          });
+          newPoints += syncValue;
         } else if (transaction.type === 'withdraw') {
-          await tx.user.update({
-            where: { id: user.id },
-            data: { points: user.points - Number(transaction.amount) }
-          });
+          // 校验余额
+          if (syncValue > newPoints) {
+            throw new Error('提现金额不能大于当前点数');
+          }
+          newPoints -= syncValue;
+          if (newPoints < 0) newPoints = 0;
         }
+        await tx.user.update({
+          where: { id: transaction.userId },
+          data: { points: newPoints }
+        });
       }
     });
 
@@ -171,7 +195,13 @@ app.post('/api/addWithdrawMethod', async (req, res) => {
 app.get('/api/users', async (req, res) => {
   const { username } = req.query;
   if (!username) return res.json([]);
-  const users = await prisma.user.findMany({ where: { username } });
+  // 伪代码，实际字段请按你的模型调整
+  const users = await prisma.user.findMany({
+    where: { username },
+    include: {
+      withdrawMethods: true // 关键！要包含提现方式
+    }
+  });
   res.json(users);
 });
 
@@ -206,6 +236,70 @@ app.get('/api/getWithdrawAccounts', async (req, res) => {
   });
   if (!user) return res.json([]);
   res.json(user.withdrawMethods);
+});
+
+app.get('/api/userinfo', async (req, res) => {
+  const { username } = req.query;
+  if (!username) return res.json({});
+  const user = await prisma.user.findUnique({ where: { username } });
+  if (!user) return res.json({});
+  res.json({ username: user.username, fullName: user.fullName });
+});
+
+app.get('/api/my-transactions', async (req, res) => {
+  const { userId, page = 1, pageSize = 20 } = req.query;
+  if (!userId) return res.json([]);
+  const transactions = await prisma.transaction.findMany({
+    where: { userId: parseInt(userId) },
+    skip: (page - 1) * pageSize,
+    take: parseInt(pageSize),
+    orderBy: { createdAt: 'desc' }
+  });
+  res.json(transactions);
+});
+
+// 文件上传接口
+app.post("/api/upload", upload.single("file"), (req, res) => {
+  // 假设静态资源目录为 /uploads
+  const url = `/uploads/${req.file.filename}`;
+  res.json({ url });
+});
+
+// 静态资源托管
+app.use("/uploads", express.static("uploads"));
+
+// 在线用户结构示例
+let onlineUsers = [
+  // { id: 1, username: 'user1', lastActive: 1710000000000 }
+];
+
+// 用户每次有操作时
+function updateUserActive(userId, username) {
+  const now = Date.now();
+  const idx = onlineUsers.findIndex(u => u.id === userId);
+  if (idx > -1) {
+    onlineUsers[idx].lastActive = now;
+  } else {
+    onlineUsers.push({ id: userId, username, lastActive: now });
+  }
+}
+
+// 定时清理离线用户（如5分钟无操作）
+setInterval(() => {
+  const now = Date.now();
+  onlineUsers = onlineUsers.filter(u => now - u.lastActive < 30 * 60 * 1000);
+}, 60 * 1000);
+
+// 提供接口
+app.get('/api/onlineUsers', (req, res) => {
+  res.json(onlineUsers);
+});
+
+app.post('/api/logout', (req, res) => {
+  const { userId } = req.body;
+  if (!userId) return res.status(400).json({ error: "缺少userId" });
+  onlineUsers = onlineUsers.filter(u => u.id !== userId);
+  res.json({ success: true });
 });
 
 app.get('/', (_, res) => res.send('Backend is up and running 👍'));
