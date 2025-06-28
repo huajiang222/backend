@@ -40,9 +40,8 @@ app.post('/api/login', async (req, res) => {
   if (!user || user.password !== password) {
     return res.status(400).json({ error: '用户名或密码错误' });
   }
-  // 新增：记录用户活跃
   updateUserActive(user.id, user.username);
-  res.json({ username: user.username, fullName: user.fullName });
+  res.json({ id: user.id, username: user.username, fullName: user.fullName }); // 返回id
 });
 
 // 创建充值或提现记录
@@ -194,14 +193,17 @@ app.post('/api/addWithdrawMethod', async (req, res) => {
 // 获取用户信息（支持通过用户名查询）
 app.get('/api/users', async (req, res) => {
   const { username } = req.query;
-  if (!username) return res.json([]);
-  // 伪代码，实际字段请按你的模型调整
-  const users = await prisma.user.findMany({
-    where: { username },
-    include: {
-      withdrawMethods: true // 关键！要包含提现方式
-    }
-  });
+  let users;
+  if (username) {
+    users = await prisma.user.findMany({
+      where: { username },
+      include: { withdrawMethods: true }
+    });
+  } else {
+    users = await prisma.user.findMany({
+      include: { withdrawMethods: true }
+    });
+  }
   res.json(users);
 });
 
@@ -269,9 +271,7 @@ app.post("/api/upload", upload.single("file"), (req, res) => {
 app.use("/uploads", express.static("uploads"));
 
 // 在线用户结构示例
-let onlineUsers = [
-  // { id: 1, username: 'user1', lastActive: 1710000000000 }
-];
+let onlineUsers = []; // 确保有这个全局变量
 
 // 用户每次有操作时
 function updateUserActive(userId, username) {
@@ -297,8 +297,9 @@ app.get('/api/onlineUsers', (req, res) => {
 
 app.post('/api/logout', (req, res) => {
   const { userId } = req.body;
+  console.log("logout api called, userId:", userId, "onlineUsers:", onlineUsers);
   if (!userId) return res.status(400).json({ error: "缺少userId" });
-  onlineUsers = onlineUsers.filter(u => u.id !== userId);
+  onlineUsers = onlineUsers.filter(u => String(u.id) !== String(userId));
   res.json({ success: true });
 });
 
